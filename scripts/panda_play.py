@@ -18,7 +18,10 @@ from transformers import (
 )
 import logging
 from enum import Enum
-import sys
+from src.callback_text_iterator_streamer import CallbackTextIteratorStreamer
+from src.falcon_prompt import falcon_prompt
+from src.mpt_prompt import mpt_prompt
+from src.prompt_common import Message, Participant
 
 logger = logging.getLogger(__name__)
 
@@ -26,18 +29,9 @@ class TokenizerOutput(TypedDict):
   input_ids: LongTensor
   attention_mask: LongTensor
 
-class Participant(Enum):
-  User = 'user'
-  Assistant = 'assistant'
-  System = 'system'
-
-class ParticipantNames(TypedDict):
-  user: str
-  assistant: str
-
-class Message(NamedTuple):
-  participant: Participant
-  message: str
+class ChatStyle(Enum):
+  MPT = 'MPT'
+  Falcon = 'Falcon'
 
 class SufficientResponse(BaseException): ...
 
@@ -77,7 +71,44 @@ class ModelArguments:
   )
   context_length: int = field(
     default=2048,
-    metadata={"help": "How many bits to use."}
+    metadata={"help": "How many tokens to include in context."}
+  )
+
+@dataclass
+class TokenizerArguments:
+  use_fast: bool = field(
+    default=True,
+    metadata={"help": "Recommend True for MPT, False for Falcon and PandaLM"}
+  )
+
+@dataclass
+class ChatArguments:
+  chat_style: str = field(
+    default=ChatStyle.MPT,
+    metadata={"help": "Prompt template with which to lay out the conversation thread"}
+  )
+  your_name: str = field(
+    default='user',
+    metadata={"help": "Your name in the chat log."}
+  )
+  bot_name: str = field(
+    default='assistant',
+    metadata={"help": "Chatbot's name in the chat log."}
+  )
+  system_prompt: str = field(
+    default='',
+    metadata={"help": "Influence how the chatbot responds, by seeding the conversation with some context."}
+  )
+
+@dataclass
+class SamplingArguments:
+  overrun_countermeasures: bool = field(
+    default=False,
+    metadata={"help": "[Recommended for Falcon, but not for MPT] Detect when bot is about to start talking to itself; end the generation before that happens. The bot is *supposed* to emit an end-of-sentence token to indicate that it's finished its reply, but very often it neglects to do this, and continues to sequence-complete the conversation. Hence this countermeasure tries to detect and prevent that."}
+  )
+  trim_leading_whitespace: bool = field(
+    default=False,
+    metadata={"help": "[Recommended for Falcon, but not for MPT] Don't allow bot to start a reply with a space or a line break."}
   )
 
 @dataclass
@@ -89,26 +120,6 @@ class MiscArguments:
   compile: bool = field(
     default=False,
     metadata={"help": "Invoke torch.compile() on the model, with mode='max-autotune'. Requires PyTorch 2, CUDA, and either Python 3.10 or Python 3.11 with a recent torch nightly. Will make the first inference from the model take a bit longer, but subsequent inferences will be faster."}
-  )
-  overrun_countermeasures: bool = field(
-    default=True,
-    metadata={"help": "Detect when bot is about to start talking to itself; end the generation before that happens. The bot is *supposed* to emit an end-of-sentence token to indicate that it's finished its reply, but very often it neglects to do this, and continues to sequence-complete the conversation. Hence this countermeasure tries to detect and prevent that."}
-  )
-  trim_leading_whitespace: bool = field(
-    default=True,
-    metadata={"help": "Don't allow bot to start a reply with a space or a line break."}
-  )
-  your_name: str = field(
-    default='Daniel',
-    metadata={"help": "Your name in the chat log."}
-  )
-  bot_name: str = field(
-    default='Girafatron',
-    metadata={"help": "Chatbot's name in the chat log."}
-  )
-  system_prompt: str = field(
-    default="Girafatron is obsessed with giraffes, the most glorious animal on the face of this Earth. Giraftron believes all other animals are irrelevant when compared to the glorious majesty of the giraffe.",
-    metadata={"help": "Influence how the chatbot responds, by seeding the conversation with some context."}
   )
 
 @dataclass
@@ -186,12 +197,12 @@ def get_model(args: ModelArguments) -> AutoModelForCausalLM:
   return model
 
 def main():
-  derived_dclasses = Tuple[List[Type[ModelArguments]], Type[GenerationArguments]] = tuple([make_dataclass(
+  derived_dclasses = Tuple[List[Type[ModelArguments]], Type[GenerationArguments], Type[TokenizerArguments], Type[ChatArguments]] = tuple([make_dataclass(
     f'{instance}{dclass.__name__}',
     fields=[(f'm0_{field.name}', field.type, field) for field in fields(dclass)]
-  ) for instance in ('M0', 'M1', 'Judge')] for dclass in (ModelArguments, GenerationArguments))
+  ) for instance in ('M0', 'M1', 'Judge')] for dclass in (ModelArguments, GenerationArguments, TokenizerArguments, ChatArguments))
 
-  model_arg_dclasses, gen_arg_dclasses = derived_dclasses
+  model_arg_dclasses, gen_arg_dclasses, tokenizer_arg_dclasses, chat_arg_dclasses = derived_dclasses
   
   # M0ModelArguments = make_dataclass('M0ModelArguments', fields=[(f'm0_{field.name}', field.type, field) for field in fields(ModelArguments)])
   # M1ModelArguments = make_dataclass('M1ModelArguments', fields=[(f'm1_{field.name}', field.type, field) for field in fields(ModelArguments)])
@@ -206,11 +217,15 @@ def main():
     # M0GenerationArguments, M1GenerationArguments, JudgeGenerationArguments,
     *model_arg_dclasses,
     *gen_arg_dclasses,
+    *tokenizer_arg_dclasses,
+    *chat_arg_dclasses,
     MiscArguments,
   ))
 
   (m0_model_args, m1_model_args, j_model_args,
    m0_gen_args, m1_gen_args, j_gen_args,
+   m0_tok_args, m1_tok_args, j_tok_args,
+   m0_chat_args, m1_chat_args, j_chat_args,
    misc_args, extra_args) = hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
 
   if extra_args:
@@ -232,11 +247,12 @@ def main():
     for model in (model0, model1, judge):
       torch.compile(model, mode='max-autotune')
   
-  tokenizers: List[PreTrainedTokenizer|PreTrainedTokenizerFast] =[AutoTokenizer.from_pretrained(
+  tokenizers: List[PreTrainedTokenizer|PreTrainedTokenizerFast] = [AutoTokenizer.from_pretrained(
     model_args.model_name_or_path,
     padding=False,
+    use_fast=tok_args.use_fast,
     # add_special_tokens=False,
-  ) for model_args in (m0_model_args, m1_model_args, j_model_args)]
+  ) for model_args, tok_args in zip((m0_model_args, m1_model_args, j_model_args), (m0_tok_args, m1_tok_args, j_tok_args))]
   m0_tok, m1_tok, j_tok = tokenizers
 
   for gen_config, tokenizer in zip(gen_configs, tokenizers):
