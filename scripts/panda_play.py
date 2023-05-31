@@ -21,7 +21,7 @@ from enum import Enum
 from src.callback_text_iterator_streamer import CallbackTextIteratorStreamer
 from src.falcon_prompt import falcon_prompt
 from src.mpt_prompt import mpt_prompt
-from src.prompt_common import Message, Participant
+from src.prompt_common import Message, Participant, HistoryToPrompt
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,11 @@ class TokenizerOutput(TypedDict):
 class ChatStyle(Enum):
   MPT = 'MPT'
   Falcon = 'Falcon'
+
+prompt_strategy: Dict[ChatStyle, HistoryToPrompt] = {
+  ChatStyle.MPT: mpt_prompt,
+  ChatStyle.Falcon: falcon_prompt,
+}
 
 class SufficientResponse(BaseException): ...
 
@@ -79,6 +84,12 @@ class TokenizerArguments:
   use_fast: bool = field(
     default=True,
     metadata={"help": "Recommend True for MPT, False for Falcon and PandaLM"}
+  )
+
+@dataclass
+class EvalArguments:
+  eval_prompt: str = field(
+    default="I'm looking for a gift for my aunt.",
   )
 
 @dataclass
@@ -159,7 +170,7 @@ def get_model(args: ModelArguments) -> AutoModelForCausalLM:
     args.model_name_or_path,
     trust_remote_code=args.trust_remote_code,
   )
-  config.update({"max_seq_len": args.context_length}) # was originally trained on 2048
+  # config.update({"max_seq_len": args.context_length}) # was originally trained on 2048
   cuda_avail = torch.cuda.is_available()
   compute_dtype = torch.bfloat16 if args.bf16 else torch.float16
   load_in_4bit = args.bits == 4 and cuda_avail
@@ -197,12 +208,12 @@ def get_model(args: ModelArguments) -> AutoModelForCausalLM:
   return model
 
 def main():
-  derived_dclasses = Tuple[List[Type[ModelArguments]], Type[GenerationArguments], Type[TokenizerArguments], Type[ChatArguments]] = tuple([make_dataclass(
+  derived_dclasses = Tuple[List[Type[ModelArguments]], Type[GenerationArguments], Type[TokenizerArguments], Type[ChatArguments], Type[SamplingArguments]] = tuple([make_dataclass(
     f'{instance}{dclass.__name__}',
     fields=[(f'm0_{field.name}', field.type, field) for field in fields(dclass)]
-  ) for instance in ('M0', 'M1', 'Judge')] for dclass in (ModelArguments, GenerationArguments, TokenizerArguments, ChatArguments))
+  ) for instance in ('M0', 'M1', 'Judge')] for dclass in (ModelArguments, GenerationArguments, TokenizerArguments, ChatArguments, SamplingArguments))
 
-  model_arg_dclasses, gen_arg_dclasses, tokenizer_arg_dclasses, chat_arg_dclasses = derived_dclasses
+  model_arg_dclasses, gen_arg_dclasses, tokenizer_arg_dclasses, chat_arg_dclasses, samp_arg_dclasses = derived_dclasses
   
   # M0ModelArguments = make_dataclass('M0ModelArguments', fields=[(f'm0_{field.name}', field.type, field) for field in fields(ModelArguments)])
   # M1ModelArguments = make_dataclass('M1ModelArguments', fields=[(f'm1_{field.name}', field.type, field) for field in fields(ModelArguments)])
@@ -219,6 +230,8 @@ def main():
     *gen_arg_dclasses,
     *tokenizer_arg_dclasses,
     *chat_arg_dclasses,
+    *samp_arg_dclasses,
+    EvalArguments,
     MiscArguments,
   ))
 
@@ -226,13 +239,21 @@ def main():
    m0_gen_args, m1_gen_args, j_gen_args,
    m0_tok_args, m1_tok_args, j_tok_args,
    m0_chat_args, m1_chat_args, j_chat_args,
-   misc_args, extra_args) = hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
+   m0_samp_args, m1_samp_args, j_samp_args,
+   eval_args, misc_args, extra_args) = hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
+
+  chat_args: List[ChatArguments] = [m0_chat_args, m1_chat_args, j_chat_args]
+  judged_chat_args: List[ChatArguments] = chat_args[:-1]
+
+  samp_args: List[SamplingArguments] = [m0_samp_args, m1_samp_args, j_samp_args]
+  judged_samp_args: List[SamplingArguments] = samp_args[:-1]
 
   if extra_args:
     raise f"Received unsupported command-line args: {extra_args}"
 
   gen_configs: List[GenerationConfig] = [GenerationConfig(**vars(gen_args)) for gen_args in (m0_gen_args, m1_gen_args, j_gen_args)]
   m0_gen_config, m1_gen_config, j_gen_config = gen_configs
+  judged_gen_configs: List[SamplingArguments] = gen_configs[:-1]
 
   # tokenizer = AutoTokenizer.from_pretrained("WeOpenML/PandaLM-7B-v1",use_fast=False)
 
@@ -241,6 +262,7 @@ def main():
 
   models: List[AutoModelForCausalLM] = [get_model(model_args).cpu() for model_args in (m0_model_args, m1_model_args, j_model_args)]
   model0, model1, judge = models
+  judged_models: List[AutoModelForCausalLM] = models[:-1]
 
   set_seed(misc_args.seed)
   if misc_args.compile:
@@ -256,88 +278,88 @@ def main():
   m0_tok, m1_tok, j_tok = tokenizers
 
   for gen_config, tokenizer in zip(gen_configs, tokenizers):
+    # TODO: I think we only wanted this for Falcon
     gen_config.eos_token_id = gen_config.pad_token_id = tokenizer.eos_token_id
 
-  stop = StopOnTokens([tokenizer.eos_token_id])
-  stopping_criteria=StoppingCriteriaList([stop])
+  for model, chat_arg, samp_arg, gen_config in zip(judged_models, judged_chat_args, judged_samp_args, judged_gen_configs):
+    history_to_prompt: HistoryToPrompt = prompt_strategy[chat_arg.chat_style]
 
-  history: List[Message] = [Message(Participant.System, misc_args.system_prompt)] if misc_args.system_prompt else []
+    stop = StopOnTokens([tokenizer.eos_token_id])
+    stopping_criteria=StoppingCriteriaList([stop])
 
-  participant_names: Dict[Participant, str] = {
-    Participant.User: misc_args.your_name,
-    Participant.Assistant: misc_args.bot_name,
-  }
+    history: List[Message] = [Message(Participant.System, chat_arg.system_prompt)] if chat_arg.system_prompt else []
 
-  first = False
-  history += [Message(Participant.User, user_input)]
+    participant_names: Dict[Participant, str] = {
+      Participant.User: chat_arg.your_name,
+      Participant.Assistant: chat_arg.bot_name,
+    }
 
-  chat_to_complete: str = '\n'.join([
-    *[
-      f"{'' if participant is Participant.System else f'{participant_names[participant]}: '}{message}"
-      for participant, message in history
-    ],
-    f'{participant_names[Participant.Assistant]}:'
-  ])
+    history += [Message(Participant.User, eval_args.eval_prompt)]
 
-  tokenized_prompts: TokenizerOutput = tokenizer(chat_to_complete, return_tensors='pt', padding=False, add_special_tokens=False)
+    chat_to_complete: str = history_to_prompt(history=history, participant_names=participant_names)
 
-  response = ''
-  if misc_args.trim_leading_whitespace:
-    strip_whitespace: Callable[[str], str] = lambda x: x.lstrip() if response == '' else x
-  else:
-    strip_whitespace: Callable[[str], str] = lambda x: x
+    tokenized_prompts: TokenizerOutput = tokenizer(chat_to_complete, return_tensors='pt', padding=False, add_special_tokens=False)
 
-  if misc_args.overrun_countermeasures:
-    # the model may continue adding to the conversation (replying to itself) instead of emitting an EOS token.
-    # we try to intercept this. If it looks like it's starting a new message in the voice of either of the chat participants: don't print that, and stop generation.
-    acc_overrun = ''
+    response = ''
+    if samp_arg.trim_leading_whitespace:
+      strip_whitespace: Callable[[str], str] = lambda x: x.lstrip() if response == '' else x
+    else:
+      strip_whitespace: Callable[[str], str] = lambda x: x
 
-    def on_text(message: str, stream_end = False):
-      nonlocal response, acc_overrun
-
-      overrun_and_message = f'{acc_overrun}{message}'
-
-      newline_ix = overrun_and_message.find('\n')
-      if newline_ix > -1:
-        pre_newline, post_newline = overrun_and_message.split('\n', maxsplit=1)
-
-        potential_participant_name = post_newline[:overrun_and_message.find(':')]
-        if potential_participant_name == f'{misc_args.your_name}:' or potential_participant_name == f'{misc_args.bot_name}:':
-          raise SufficientResponse()
-        if potential_participant_name.rstrip(f'{misc_args.your_name}:') == '' or potential_participant_name.rstrip(f'{misc_args.bot_name}:') == '':
-          # could potentially grow to match one of the names. we need to accumulate to see whether that's where the bot was going.
-          acc_overrun = f'\n{post_newline}'
-
-          addendum: str = strip_whitespace(pre_newline)
-          response += addendum
-          print(addendum, end='', flush=True)
-          return
-        # the potential_participant_name cannot grow into a reply from either chat participant, so this must be something else. flush everything we accumulated.
-
-      addendum: str = strip_whitespace(overrun_and_message)
-      response += addendum
-      print(addendum, end='', flush=True)
+    if samp_arg.overrun_countermeasures:
+      # the model may continue adding to the conversation (replying to itself) instead of emitting an EOS token.
+      # we try to intercept this. If it looks like it's starting a new message in the voice of either of the chat participants: don't print that, and stop generation.
       acc_overrun = ''
-  else:
-    def on_text(message: str, stream_end = False):
-      nonlocal response
-      addendum: str = strip_whitespace(message)
-      response += addendum
-      print(addendum, end='', flush=True)
 
-  try:
-    prediction: LongTensor = model.generate(
-      input_ids=tokenized_prompts.input_ids.to(model.device),
-      attention_mask=tokenized_prompts.attention_mask.to(model.device),
-      generation_config=generation_config,
-      do_sample=generation_config.temperature > 0.,
-      stopping_criteria=stopping_criteria,
-    )
-    # if you wanted to see the result, you can do so like this:
-    #   decode: List[str] = tokenizer.decode(prediction[0,tokenized_prompts.input_ids.size(-1):], skip_special_tokens=True, clean_up_tokenization_spaces=True)
-    # but we're already streaming it to the console via our callback
-  except (KeyboardInterrupt, SufficientResponse):
-    pass
+      def on_text(message: str, stream_end = False):
+        nonlocal response, acc_overrun
+
+        overrun_and_message = f'{acc_overrun}{message}'
+
+        newline_ix = overrun_and_message.find('\n')
+        if newline_ix > -1:
+          pre_newline, post_newline = overrun_and_message.split('\n', maxsplit=1)
+
+          potential_participant_name = post_newline[:overrun_and_message.find(':')]
+          if potential_participant_name == f'{misc_args.your_name}:' or potential_participant_name == f'{misc_args.bot_name}:':
+            raise SufficientResponse()
+          if potential_participant_name.rstrip(f'{misc_args.your_name}:') == '' or potential_participant_name.rstrip(f'{misc_args.bot_name}:') == '':
+            # could potentially grow to match one of the names. we need to accumulate to see whether that's where the bot was going.
+            acc_overrun = f'\n{post_newline}'
+
+            addendum: str = strip_whitespace(pre_newline)
+            response += addendum
+            # print(addendum, end='', flush=True)
+            return
+          # the potential_participant_name cannot grow into a reply from either chat participant, so this must be something else. flush everything we accumulated.
+
+        addendum: str = strip_whitespace(overrun_and_message)
+        response += addendum
+        # print(addendum, end='', flush=True)
+        acc_overrun = ''
+    else:
+      def on_text(message: str, stream_end = False):
+        nonlocal response
+        addendum: str = strip_whitespace(message)
+        response += addendum
+        # print(addendum, end='', flush=True)
+
+    try:
+      # todo: find a way to preserve device map
+      model.to('cuda')
+      prediction: LongTensor = model.generate(
+        input_ids=tokenized_prompts.input_ids.to(model.device),
+        attention_mask=tokenized_prompts.attention_mask.to(model.device),
+        generation_config=gen_config,
+        do_sample=gen_config.temperature > 0.,
+        streamer=on_text,
+        stopping_criteria=stopping_criteria,
+      )
+      model.cpu()
+      decode: List[str] = tokenizer.decode(prediction[0,tokenized_prompts.input_ids.size(-1):], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+      print(decode)
+    except (KeyboardInterrupt, SufficientResponse):
+      pass
 
 if __name__ == "__main__":
   main()

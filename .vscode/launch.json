@@ -1,21 +1,28 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": [
-      {
-        "name": "Python: Panda play",
-        "type": "python",
-        "request": "launch",
-        "module": "scripts.panda_play",
-        "justMyCode": false,
-        "args": [
-          "--bf16",
-          "--trust_remote_code"
-        ],
-        "env": {
-        }
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Panda play",
+      "type": "python",
+      "request": "launch",
+      "module": "scripts.panda_play",
+      "justMyCode": false,
+      "args": [
+        "--m0_model_name_or_path", "Birchlabs/mosaicml-mpt-7b-chat-qlora",
+        "--m0_bf16",
+        "--m0_trust_remote_code",
+        "--m1_model_name_or_path", "tiiuae/falcon-7b-instruct",
+        "--m1_bf16",
+        "--m1_trust_remote_code",
+        "--j_model_name_or_path", "WeOpenML/PandaLM-7B-v1",
+        "--j_bf16",
+        "--j_trust_remote_code", "False",
+      ],
+      "env": {
       }
-    ]
-  }
+    }
+  ]
+}
